@@ -1,9 +1,11 @@
-﻿#Copy-BITSRecursive.ps1
+﻿#requires -version 3.0
+#Copy-BITSRecursive.ps1
 <#
     .Synopsis
     Copy a directory and contents recusively with BITS low priority
     .DESCRIPTION
-    Long description
+    start a crapload of bits jobs and let them finish whenever
+    monitor for completed jobs and log them (also need to log jobs we can't start)
     .EXAMPLE
     Example of how to use this cmdlet
     .EXAMPLE
@@ -13,12 +15,10 @@
     If there are no files in the $source root folder, it will not be created on $dest
     2020-06-25 add progress bar
     2020-07-06 v1 final (start each job and wait for it to finish before next one)
-    2020-07-15 V2 just start a crapload of bits jobs and let them finish whenever
+    2020-07-30 alternate approach. Start all bits jobs at once and wait for them to finish
     TODO
-    wrap in a workflow so entire script will survive a reboot
-    -alternate approach: just start a crapload of bits jobs and let them finish whenever
-    --monitor for completed jobs and log them (also need to log jobs we can't start)
     get files/bytes total summary from each bits transfer for end summary
+    make logname a parameter
 #>
 [CmdletBinding()]
 Param (
@@ -32,7 +32,7 @@ Param (
 
 Begin {
   Try {
-    Import-Module BitsTransfer
+    Import-Module -Name BitsTransfer
   } Catch {
     Throw 'Required module BitsTransfer not found'
   }
@@ -40,73 +40,68 @@ Begin {
   if (!($Source.EndsWith('\'))) {
     $Source = $Source + '\'
   }
-  Write-Verbose "gathering folders"
+  Write-Verbose -Message "gathering folders"
   $folders = Get-ChildItem -Name -Path $source -Directory -Recurse
-  $delay = 4
   $TotalFolders = $folders.count
-  Write-Verbose "Copying $($TotalFolders) total folders"
+  Write-Verbose -Message "Copying $($TotalFolders) total folders"
 }
 Process {
   $FolderCount = 0
-  $ErrFolders = @()
-  Write-Verbose "Starting BITS jobs"
-  #Start root folder
+  #start files in root folder
+  Write-Verbose -Message 'starting BITS jobs'
   if (Test-Path -Path ('{0}\*.*' -f $Source) -PathType Leaf) {
     $bitsjob = Start-BitsTransfer -Source $Source\*.* -Destination $Dest -asynchronous -Priority low
     $bitsjob.Description = ('{0} -> {1}' -f ($Source), ($Dest))
-    <#    while (($bitsjob.JobState.ToString() -eq 'Transferring') -or ($bitsjob.JobState.ToString() -eq 'Connecting')){
-        Start-Sleep -Seconds $delay
-        }
-        Complete-BitsTransfer -BitsJob $bitsjob
-    #>
   }
-  #Start BITS jobs for subfolders
+  #start files in subfolders
+  $ErrFolders = @()
   foreach ($i in $folders) {
     if (!(Test-Path -Path $Dest\$i)) {
       $null = New-Item -Path $Dest\$i -ItemType Directory
     }
-    Write-Verbose "copying $i"
+    Write-Verbose -Message "copying $i"
     $FolderCount++
     $Percentage = (($FolderCount/$TotalFolders)*100)
-    Write-Progress -Activity ('Copying {0}{1}' -f $Source, $i) -Status "copied $($FolderCount) of $($TotalFolders) folders" -PercentComplete $Percentage
+    Write-Progress -Activity ('Copying {0}{1}' -f $Source, $i) -Status "Started $($FolderCount) of $($TotalFolders) folders" -PercentComplete $Percentage
     if (Test-Path -Path ('{0}{1}\*.*' -f $Source, $i) -PathType Leaf) {
       $err = $false
       Try {
         $bitsjob = Start-BitsTransfer -Source $Source$i\*.* -Destination $Dest\$i -asynchronous -Priority low
       } catch {
         $err = $true
-        $ErrFolders += $i
       }
       if ($err) {
-        Write-Host ('ERROR: {0} - skipping' -f $error[0].tostring()) 
-        ('ERROR: {0} - skipping {1}' -f $error[0].tostring(), $i) | Out-File c:\server\errs.log -Append
+        Write-Host ('ERROR: {0} - skipping {1}' -f $error[0].tostring(), $i) 
+        ('ERROR: {0} - skipping {1}' -f $error[0].tostring(), $i) | Out-File -FilePath c:\server\errs.log -Append
+        $ErrFolders +=  $i
       } else {
-        $bitsjob.Description = ('{0}' -f $i)
-        <#        while (($bitsjob.JobState.ToString() -eq 'Transferring') -or ($bitsjob.JobState.ToString() -eq 'Connecting')) {
-            Start-Sleep -Seconds $delay
-            }
-            #Log Fields: JobId, DisplayName,Description,ErrorContext,ErrorCondition,InternalErrorCode, BytesTotal, FilesTotal,CreationTime
-            Write-Host $bitsjob.CreationTime, $bitsjob.Description, $bitsjob.BytesTotal , $bitsjob.FilesTotal, $i
-            $bitsjob.CreationTime, $bitsjob.Description, $bitsjob.BytesTotal , $bitsjob.FilesTotal | Export-Csv c:\server\bits.log -Append -NoTypeInformation
-            Complete-BitsTransfer -BitsJob $bitsjob
-        #>
+        $bitsjob.DisplayName = ('{0}' -f $i)
+      } #job started & description saved
+    }
+  } #end loop to start jobs 
+  Write-Verbose -Message ('{0} jobs errored on start' -f $ErrFolders.count)
+  #clean up jobs as they finish
+  Write-Verbose -Message 'waiting for BITS jobs to complete'
+  $BitsJobs = Get-BitsTransfer
+  $TotalJobs = $BitsJobs.count
+  While ($BitsJobs) {
+    $BitsCount = $BitsJobs.count
+    $Percentage = ($TotalJobs - $BitsCount)/$TotalJobs
+    Write-Progress -Activity ('Copying {0}{1}' -f $Source, $i) -Status "Started $($FolderCount) of $($TotalJobs) folders" -PercentComplete $Percentage
+    foreach ($Job in $BitsJobs) {
+      if ($Job.JobState.ToString() -eq 'Transferred') {
+        #Log Fields: JobId, DisplayName,Description,ErrorContext,ErrorCondition,InternalErrorCode, BytesTotal, FilesTotal,CreationTime
+        Write-Host $Job.CreationTime, $Job.DisplayName, $Job.BytesTotal , $Job.FilesTotal, $i
+        $Job.CreationTime, $Job.DisplayName, $Job.BytesTotal , $Job.FilesTotal | Export-Csv -Path c:\server\bits.log -Append -NoTypeInformation
+        Complete-BitsTransfer -BitsJob $Job
       }
     }
-  } #Start all BITSjobs
-  $FolderCount = 0
-  $BITSJobs = Get-BitsTransfer
-  While ($BITSJobs) {
-    $Percentage = (($FolderCount/$TotalFolders)*100)
-    Write-Progress -Activity ('Running BITSJobs') -Status "Completed $($FolderCount) of $($TotalFolders) jobss" -PercentComplete $Percentage
-    foreach ($Job in $BITSJobs) {
-      if ($Job.JobState.ToString() -eq 'Complete') {
-        Write-Host $Job.CreationTime, $Job.Description, $Job.BytesTotal , $Job.FilesTotal
-        Complete-BitsTransfer -BitsJob $Job
-        $FolderCount++
-      }
-    } #Processe all completed jobs
-    $BITSJobs = Get-BitsTransfer
+    $BitsJobs = Get-BitsTransfer
   }
+  #Write-Host $bitsjob.CreationTime, $bitsjob.DisplayName, $bitsjob.BytesTotal , $bitsjob.FilesTotal
+  <# while (($bitsjob.JobState.ToString() -eq 'Transferring') -or ($bitsjob.JobState.ToString() -eq 'Connecting')) {
+      Start-Sleep -Seconds $delay
+  } #>
 }
 End {
 }
